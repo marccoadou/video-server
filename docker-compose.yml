@@ -1,12 +1,15 @@
 services:
   postgres:
     image: postgres:latest
+    container_name: postgres_db
     ports:
       - "5432:5432"
-    restart: always
-    volumes:
-      - ~/apps/postgres:/var/lib/postgresql/data
     environment:
-      - POSTGRES_PASSWORD=password
-      - POSTGRES_USER=postgres_user
-      - POSTGRES_DB=emby-server
+      POSTGRES_USER: postgres_user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: emby
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+volumes:
+  postgres_data:

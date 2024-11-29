@@ -1,32 +1,54 @@
-mod media;
+mod models;
+mod routes;
+mod services;
 
-use axum::routing::get;
-use axum::{Json, Router};
-use serde::Serialize;
+use crate::routes::media::{get_file, get_media, post_media, stream_media};
+use axum::http::Method;
+use axum::routing::{get, post};
+use axum::Router;
+use dotenv::dotenv;
+use futures::executor::block_on;
+use sea_orm::{Database, DbErr};
+use std::env;
+use tower_http::cors::{Any, CorsLayer};
 
-#[derive(Serialize)]
-struct MediaItem {
-    id: u32,
-    title: String,
-    path: String,
+pub fn cors() -> CorsLayer {
+    CorsLayer::new()
+        .allow_methods([Method::GET, Method::HEAD])
+        .allow_headers(Any)
+        .allow_origin(Any)
 }
 
-async fn get_media() -> Json<Vec<MediaItem>> {
-    let media = vec![MediaItem {
-        id: 1,
-        title: "Another cool movie".to_string(),
-        path: "/somewhere/movie.mp4".to_string(),
-    }];
+async fn run() -> Result<(), DbErr> {
+    let database_url =
+        env::var("DATABASE_URL").expect("Environment variable DATABASE_URL is required");
 
-    Json(media)
+    let _db = Database::connect(database_url);
+
+    Ok(())
+}
+
+pub fn create_routes() -> Router {
+    Router::new()
+        .route("/medias", get(get_media))
+        .route("/medias", post(post_media))
+        .route("/medias/get_file", post(get_file))
+        .route("/medias/stream", get(stream_media))
 }
 
 #[tokio::main]
 async fn main() {
-    let app = Router::new().route("/", get(get_media));
+    dotenv().ok();
+
+    if let Err(err) = block_on(run()) {
+        panic!("{:?}", err);
+    };
+
+    let app = Router::new().merge(create_routes()).layer(cors());
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
         .await
         .unwrap();
+
     axum::serve(listener, app).await.unwrap();
 }
