@@ -1,12 +1,13 @@
-use crate::models::{CreateMediaItem, MediaItem};
+use crate::models::{CreateMediaItem, MediaInfo, MediaItem};
+use crate::services::{codec_info, get_content_range, partial_media_content};
 use axum::body::Body;
 use axum::http::{header, HeaderMap, Response, StatusCode};
 use axum::Json;
+use ffmpeg_next as ffmpeg;
 use mime_guess::from_path;
-use std::io::{BufRead, SeekFrom};
 use tokio::fs;
 use tokio::fs::File;
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::io::AsyncReadExt;
 
 pub async fn get_media() -> Json<Vec<MediaItem>> {
     let media = vec![MediaItem {
@@ -46,11 +47,61 @@ pub async fn get_file(
 
     let mime_type = from_path(&media.path).first_or_octet_stream();
 
-    Ok(Response::builder()
-        .header("Content-Type", mime_type.as_ref())
-        .header("Content-Length", file_contents.len().to_string())
+    let response = Response::builder()
+        .header(header::CONTENT_TYPE, mime_type.as_ref())
+        .header(header::CONTENT_LENGTH, file_contents.len().to_string())
         .body(Body::from(file_contents))
-        .unwrap())
+        .unwrap();
+
+    Ok(response)
+}
+
+pub async fn get_media_info() -> Result<Response<Body>, (StatusCode, String)> {
+    let media = MediaItem {
+        id: 1,
+        title: "Nightcrawler".to_string(),
+        path: "./medias/Nightcrawler 2014 MULTi VFF 1080p BluRay AC3 x265-Winks.mkv".to_string(),
+        created_at: chrono::Utc::now().naive_utc(),
+    };
+
+    if let Err(_e) = ffmpeg::init() {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "ffmpeg init failed".to_string(),
+        ));
+    }
+
+    let ictx = match ffmpeg::format::input(&media.path) {
+        Ok(ictx) => ictx,
+        Err(_e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                String::from("Internal server error"),
+            ))
+        }
+    };
+
+    let mut codecs = Vec::new();
+
+    // Access each streams individually with their information
+    for (_index, input_stream) in ictx.streams().enumerate() {
+        let codec_info = codec_info(input_stream);
+        codecs.push(codec_info);
+    }
+
+    let info = MediaInfo {
+        name: media.title,
+        codecs,
+    };
+
+    let response_body = serde_json::to_string(&info).unwrap();
+
+    let response = Response::builder()
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(response_body))
+        .unwrap();
+
+    Ok(response)
 }
 
 pub async fn stream_media(headers: HeaderMap) -> Result<Response<Body>, StatusCode> {
@@ -68,37 +119,27 @@ pub async fn stream_media(headers: HeaderMap) -> Result<Response<Body>, StatusCo
     let metadata = file.metadata().await.map_err(|_| StatusCode::NOT_FOUND)?;
     let file_size = metadata.len();
 
+    // If the request contains Content Range, serve a ranged stream
     if let Some(range_header) = headers.get(header::RANGE) {
-        let range_str = range_header.to_str().map_err(|_| StatusCode::BAD_REQUEST)?;
+        let (body, start, end, chunk_size) =
+            partial_media_content(&mut file, range_header, file_size).await?;
 
-        if let Some((start, end)) = parse_range_header(range_str, file_size) {
-            file.seek(SeekFrom::Start(start))
-                .await
-                .map_err(|_| StatusCode::BAD_REQUEST)?;
+        dbg!(start, end, file_size);
 
-            let end = end.unwrap_or(file_size - 1);
-            let chunk_size = (end - start + 1) as usize;
+        let response = Response::builder()
+            .status(StatusCode::PARTIAL_CONTENT)
+            .header(header::CONTENT_TYPE, "video/mp4")
+            .header(
+                header::CONTENT_RANGE,
+                get_content_range(start, end, file_size),
+            )
+            .header(header::CONTENT_LENGTH, chunk_size.to_string())
+            .body(body)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-            let mut buffer = vec![0; chunk_size];
+        dbg!(&response);
 
-            file.read_exact(&mut buffer)
-                .await
-                .map_err(|_| StatusCode::BAD_REQUEST)?;
-            let body = Body::from(buffer);
-
-            let response = Response::builder()
-                .status(StatusCode::PARTIAL_CONTENT)
-                .header(header::CONTENT_TYPE, "video/mp4")
-                .header(
-                    header::CONTENT_RANGE,
-                    format!("bytes {}-{}/{}", start, end, file_size),
-                )
-                .header(header::CONTENT_LENGTH, chunk_size.to_string())
-                .body(body)
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-            return Ok(response);
-        }
+        return Ok(response);
     }
 
     let mut buffer = Vec::new();
@@ -116,29 +157,4 @@ pub async fn stream_media(headers: HeaderMap) -> Result<Response<Body>, StatusCo
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(response)
-}
-
-pub fn parse_range_header(range: &str, file_size: u64) -> Option<(u64, Option<u64>)> {
-    if !range.starts_with("bytes=") {
-        return None;
-    }
-
-    let range = &range["bytes=".len()..];
-    let parts: Vec<&str> = range.split("-").collect();
-
-    if let (Some(start), Some(end)) = (parts.get(0), parts.get(1)) {
-        let start = start.parse::<u64>().ok()?;
-
-        let end = if end.is_empty() {
-            None
-        } else {
-            Some(end.parse::<u64>().ok()?)
-        };
-
-        if start < file_size {
-            return Some((start, end));
-        }
-    }
-
-    None
 }
