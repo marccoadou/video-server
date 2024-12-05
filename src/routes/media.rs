@@ -1,13 +1,140 @@
 use crate::models::{CreateMediaItem, MediaInfo, MediaItem};
-use crate::services::{codec_info, get_content_range, partial_media_content};
+use crate::services::{
+    codec_info, get_content_range, parse_opts, partial_media_content, Transcoder, DEFAULT_X264_OPTS,
+};
 use axum::body::Body;
 use axum::http::{header, HeaderMap, Response, StatusCode};
 use axum::Json;
 use ffmpeg_next as ffmpeg;
+use ffmpeg_next::{codec, encoder, format, log, media, Rational};
 use mime_guess::from_path;
+use std::collections::HashMap;
 use tokio::fs;
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
+
+pub async fn transcode_media(_headers: HeaderMap) -> Result<Response<Body>, StatusCode> {
+    ffmpeg::init().unwrap();
+    log::set_level(log::Level::Info);
+
+    let mut ictx =
+        format::input("./medias/Kingsman The Secret Service (2014) WEBDL-1080p.mkv").unwrap();
+    let mut octx = format::output("./medias/output.mp4").unwrap();
+
+    // this dumps the info the err terminal
+    format::context::input::dump(
+        &ictx,
+        0,
+        Some("./medias/Kingsman The Secret Service (2014) WEBDL-1080p.mkv"),
+    );
+
+    let best_video_stream_index = ictx
+        .streams()
+        .best(media::Type::Video)
+        .map(|stream| stream.index());
+
+    let mut stream_mapping: Vec<isize> = vec![0; ictx.nb_streams() as _];
+    let mut ist_time_bases = vec![Rational(0, 0); ictx.nb_streams() as _];
+    let mut ost_time_bases = vec![Rational(0, 0); ictx.nb_streams() as _];
+    let mut transcoders = HashMap::new();
+    let mut ost_index = 0;
+
+    // For each stream
+    for (ist_index, ist) in ictx.streams().enumerate() {
+        // Récupérer le medium du Codec : Video / Audio / Sous-Titres
+        let ist_medium = ist.parameters().medium();
+        // Si le medium ne fait pas partie de ces groupes, on ne l'utilise pas
+        if ist_medium != media::Type::Video && ist_medium != media::Type::Audio
+        // && ist_medium != media::Type::Subtitle
+        {
+            stream_mapping[ist_index] = -1;
+            continue;
+        }
+        // Mapper l'index
+        stream_mapping[ist_index] = ost_index;
+        // Mapper la time_base
+        ist_time_bases[ist_index] = ist.time_base();
+        let x264_opts = parse_opts(DEFAULT_X264_OPTS.to_string()).unwrap();
+
+        if ist_medium == media::Type::Video {
+            // Initialiser le transcodeur pour le stream Video
+            transcoders.insert(
+                ist_index,
+                Transcoder::new(
+                    &ist,
+                    &mut octx,
+                    ost_index as _,
+                    x264_opts,
+                    Some(ist_index) == best_video_stream_index,
+                )
+                .unwrap(),
+            );
+        } else {
+            // Set up for stream copy for non-video stream.
+            let mut ost = octx.add_stream(encoder::find(codec::Id::None)).unwrap();
+            ost.set_parameters(ist.parameters());
+            // We need to set codec_tag to 0 lest we run into incompatible codec tag
+            // issues when muxing into a different container format. Unfortunately
+            // there's no high level API to do this (yet).
+            unsafe {
+                (*ost.parameters().as_mut_ptr()).codec_tag = 0;
+            }
+        }
+        ost_index += 1;
+    }
+
+    octx.set_metadata(ictx.metadata().to_owned());
+    format::context::output::dump(&octx, 0, Some("./medias/output.mp4"));
+    octx.write_header().unwrap();
+
+    for (ost_index, _) in octx.streams().enumerate() {
+        ost_time_bases[ost_index] = octx.stream(ost_index as _).unwrap().time_base();
+    }
+
+    for (stream, mut packet) in ictx.packets() {
+        let ist_index = stream.index();
+        let ost_index = stream_mapping[ist_index];
+        if ost_index < 0 {
+            continue;
+        }
+
+        let ost_time_base = ost_time_bases[ost_index as usize];
+        match transcoders.get_mut(&ist_index) {
+            // transcode what needs to be transcoded
+            Some(transcoder) => {
+                transcoder.send_packet_to_decoder(&packet);
+                transcoder.receive_and_process_decoded_frames(&mut octx, ost_time_base);
+            }
+            // Just copy the streams
+            None => {
+                packet.rescale_ts(ist_time_bases[ist_index], ost_time_base);
+                packet.set_position(-1);
+                packet.set_stream(ost_index as _);
+                packet.write_interleaved(&mut octx).unwrap()
+            }
+        }
+    }
+
+    // Flush encoders and decoders.
+    for (ost_index, transcoder) in transcoders.iter_mut() {
+        let ost_time_base = ost_time_bases[*ost_index];
+        transcoder.send_eof_to_decoder();
+        transcoder.receive_and_process_decoded_frames(&mut octx, ost_time_base);
+        transcoder.send_eof_to_decoder();
+        transcoder.receive_and_process_encoded_packets(&mut octx, ost_time_base);
+    }
+
+    octx.write_trailer().unwrap();
+
+    let response = Response::builder()
+        .status(StatusCode::OK)
+        // .header("Content-Type", "video/mp4")
+        // .header("Content-Length", file_size.to_string())
+        .body(Body::empty())
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(response)
+}
 
 pub async fn get_media() -> Json<Vec<MediaItem>> {
     let media = vec![MediaItem {
@@ -60,7 +187,7 @@ pub async fn get_media_info() -> Result<Response<Body>, (StatusCode, String)> {
     let media = MediaItem {
         id: 1,
         title: "Nightcrawler".to_string(),
-        path: "./medias/Nightcrawler 2014 MULTi VFF 1080p BluRay AC3 x265-Winks.mkv".to_string(),
+        path: "./medias/Kingsman The Secret Service (2014) WEBDL-1080p.mkv".to_string(),
         created_at: chrono::Utc::now().naive_utc(),
     };
 
@@ -80,6 +207,8 @@ pub async fn get_media_info() -> Result<Response<Body>, (StatusCode, String)> {
             ))
         }
     };
+
+    format::context::input::dump(&ictx, 0, Some(&media.path));
 
     let mut codecs = Vec::new();
 

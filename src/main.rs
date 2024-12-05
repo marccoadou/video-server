@@ -4,7 +4,9 @@ mod models;
 mod routes;
 mod services;
 
-use crate::routes::media::{get_file, get_media, get_media_info, post_media, stream_media};
+use crate::routes::media::{
+    get_file, get_media, get_media_info, post_media, stream_media, transcode_media,
+};
 use axum::http::Method;
 use axum::routing::{get, post};
 use axum::Router;
@@ -37,6 +39,7 @@ pub fn create_routes() -> Router {
         .route("/medias/get_file", post(get_file))
         .route("/medias/stream", get(stream_media))
         .route("/medias/info", get(get_media_info))
+        .route("/medias/transcode", get(transcode_media))
 }
 
 #[tokio::main]

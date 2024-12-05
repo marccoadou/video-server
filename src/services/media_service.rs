@@ -1,10 +1,3 @@
-// use axum::body::Body;
-// use axum::http::{header, HeaderValue, Response, StatusCode};
-// use std::io::SeekFrom;
-// use tokio::fs::File;
-// use tokio::io::{AsyncReadExt, AsyncSeekExt};
-//
-
 use crate::models::CodecInfo;
 use axum::body::Body;
 use axum::http::{HeaderValue, StatusCode};
@@ -27,6 +20,7 @@ pub async fn full_media_content(file: &mut File) -> Result<Body, StatusCode> {
 pub fn get_content_range(start: u64, end: u64, total: u64) -> String {
     format!("bytes {}-{}/{:?}", start, end, total)
 }
+
 pub async fn partial_media_content(
     file: &mut File,
     range_header: &HeaderValue,
