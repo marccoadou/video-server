@@ -6,6 +6,7 @@ mod services;
 
 use crate::routes::media::{
     get_file, get_media, get_media_info, post_media, stream_media, transcode_media,
+    transcode_subtitles,
 };
 use axum::http::Method;
 use axum::routing::{get, post};
@@ -40,6 +41,7 @@ pub fn create_routes() -> Router {
         .route("/medias/stream", get(stream_media))
         .route("/medias/info", get(get_media_info))
         .route("/medias/transcode", get(transcode_media))
+        .route("/medias/transcode-subtitle", get(transcode_subtitles))
 }
 
 #[tokio::main]

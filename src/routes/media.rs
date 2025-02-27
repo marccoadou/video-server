@@ -1,32 +1,67 @@
 use crate::models::{CreateMediaItem, MediaInfo, MediaItem};
 use crate::services::{
-    codec_info, get_content_range, parse_opts, partial_media_content, Transcoder, DEFAULT_X264_OPTS,
+    codec_info, get_content_range, parse_opts, partial_media_content, SubtitleTranscoder,
+    Transcoder, VideoTranscoder, DEFAULT_X264_OPTS,
 };
 use axum::body::Body;
 use axum::http::{header, HeaderMap, Response, StatusCode};
 use axum::Json;
 use ffmpeg_next as ffmpeg;
-use ffmpeg_next::{codec, encoder, format, log, media, Rational};
+use ffmpeg_next::codec::Parameters;
+use ffmpeg_next::format::output;
+use ffmpeg_next::{codec, encoder, format, log, media, packet, Rational};
 use mime_guess::from_path;
 use std::collections::HashMap;
 use tokio::fs;
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
 
+pub async fn transcode_subtitles(_headers: HeaderMap) -> Result<Response<Body>, StatusCode> {
+    ffmpeg_next::init().unwrap();
+    log::set_level(log::Level::Info);
+
+    let input_file_path = "./medias/kingsman/Kingsman The Secret Service (2014) WEBDL-1080p.mkv";
+    let mut input_context = format::input(&input_file_path).unwrap();
+    format::context::input::dump(&input_context, 0, Some(&input_file_path));
+
+    let (subtitle_stream_index, subtitle_params) = input_context
+        .streams()
+        .best(ffmpeg::media::Type::Subtitle)
+        .ok_or(ffmpeg::Error::StreamNotFound)
+        .map(|stream| (stream.index(), stream.parameters()))
+        .unwrap();
+
+    let decoder_ctx = codec::context::Context::from_parameters(subtitle_params).unwrap();
+    let decoder = decoder_ctx.decoder().subtitle().unwrap();
+
+    let mut output_ctx = output("./medias/kingsman/subtitle.srt").unwrap();
+    let mut output_stream = output_ctx
+        .add_stream(ffmpeg::encoder::find(codec::Id::SUBRIP))
+        .unwrap();
+
+    let mut output_params = Parameters::new();
+    // output_params;
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .body(Body::empty())
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
 pub async fn transcode_media(_headers: HeaderMap) -> Result<Response<Body>, StatusCode> {
     ffmpeg::init().unwrap();
     log::set_level(log::Level::Info);
+    /* let input_file_name = "Kingsman The Secret Service (2014) WEBDL-1080p.mkv";
+    let output_folder = "./medias/kingsman"; */
 
-    let mut ictx =
-        format::input("./medias/Kingsman The Secret Service (2014) WEBDL-1080p.mkv").unwrap();
-    let mut octx = format::output("./medias/output.mp4").unwrap();
+    let input_file_path = "./medias/Foundation.S02E03.MULTi.1080p.WEBRip.x264.AC3-MULTiViSiON.mkv";
+    // let ouput_file_path = output_folder.to_string() + "/" + input_file_name;
+
+    let mut ictx = format::input(&input_file_path).unwrap();
+    let mut octx = format::output(&input_file_path).unwrap();
 
     // this dumps the info the err terminal
-    format::context::input::dump(
-        &ictx,
-        0,
-        Some("./medias/Kingsman The Secret Service (2014) WEBDL-1080p.mkv"),
-    );
+    // format::context::input::dump(&ictx, 0, Some(&input_file_path));
 
     let best_video_stream_index = ictx
         .streams()
@@ -34,50 +69,81 @@ pub async fn transcode_media(_headers: HeaderMap) -> Result<Response<Body>, Stat
         .map(|stream| stream.index());
 
     let mut stream_mapping: Vec<isize> = vec![0; ictx.nb_streams() as _];
+    /*     let mut subtitle_streams_mapping = vec![0; ictx.nb_streams() as _]; */
     let mut ist_time_bases = vec![Rational(0, 0); ictx.nb_streams() as _];
     let mut ost_time_bases = vec![Rational(0, 0); ictx.nb_streams() as _];
-    let mut transcoders = HashMap::new();
+    let mut transcoders: HashMap<usize, Box<dyn Transcoder>> = HashMap::new();
     let mut ost_index = 0;
 
     // For each stream
     for (ist_index, ist) in ictx.streams().enumerate() {
         // Récupérer le medium du Codec : Video / Audio / Sous-Titres
         let ist_medium = ist.parameters().medium();
+
+        dbg!(&ist_medium);
+
         // Si le medium ne fait pas partie de ces groupes, on ne l'utilise pas
-        if ist_medium != media::Type::Video && ist_medium != media::Type::Audio
-        // && ist_medium != media::Type::Subtitle
+        if ist_medium != media::Type::Video
+            && ist_medium != media::Type::Audio
+            && ist_medium != media::Type::Subtitle
         {
             stream_mapping[ist_index] = -1;
             continue;
         }
+
         // Mapper l'index
         stream_mapping[ist_index] = ost_index;
+
         // Mapper la time_base
         ist_time_bases[ist_index] = ist.time_base();
         let x264_opts = parse_opts(DEFAULT_X264_OPTS.to_string()).unwrap();
 
-        if ist_medium == media::Type::Video {
-            // Initialiser le transcodeur pour le stream Video
-            transcoders.insert(
-                ist_index,
-                Transcoder::new(
-                    &ist,
-                    &mut octx,
-                    ost_index as _,
-                    x264_opts,
-                    Some(ist_index) == best_video_stream_index,
-                )
-                .unwrap(),
-            );
-        } else {
-            // Set up for stream copy for non-video stream.
-            let mut ost = octx.add_stream(encoder::find(codec::Id::None)).unwrap();
-            ost.set_parameters(ist.parameters());
-            // We need to set codec_tag to 0 lest we run into incompatible codec tag
-            // issues when muxing into a different container format. Unfortunately
-            // there's no high level API to do this (yet).
-            unsafe {
-                (*ost.parameters().as_mut_ptr()).codec_tag = 0;
+        match ist_medium {
+            media::Type::Video => {
+                transcoders.insert(
+                    ist_index,
+                    Box::new(
+                        VideoTranscoder::new(
+                            &ist,
+                            &mut octx,
+                            ost_index as _,
+                            x264_opts,
+                            Some(ist_index) == best_video_stream_index,
+                        )
+                        .unwrap(),
+                    ),
+                );
+            }
+            // media::Type::Audio => {
+            //
+            // }
+            media::Type::Subtitle => {
+                let mut sub_octx =
+                    format::output(&format!("./medias/subtitle-{}.srt", ist_index)).unwrap();
+
+                transcoders.insert(
+                    ist_index,
+                    Box::new(
+                        SubtitleTranscoder::new(
+                            &ist,
+                            &mut sub_octx,
+                            ost_index as _,
+                            x264_opts,
+                            Some(ist_index) == best_video_stream_index,
+                        )
+                        .unwrap(),
+                    ),
+                );
+            }
+            _ => {
+                let mut ost = octx.add_stream(encoder::find(codec::Id::None)).unwrap();
+                ost.set_parameters(ist.parameters());
+                // We need to set codec_tag to 0 lest we run into incompatible codec tag
+                // issues when muxing into a different container format. Unfortunately
+                // there's no high level API to do this (yet).
+                unsafe {
+                    (*ost.parameters().as_mut_ptr()).codec_tag = 0;
+                }
             }
         }
         ost_index += 1;
@@ -94,6 +160,7 @@ pub async fn transcode_media(_headers: HeaderMap) -> Result<Response<Body>, Stat
     for (stream, mut packet) in ictx.packets() {
         let ist_index = stream.index();
         let ost_index = stream_mapping[ist_index];
+
         if ost_index < 0 {
             continue;
         }
